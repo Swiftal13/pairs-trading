@@ -1,9 +1,14 @@
 """
 Basic pairs trading, built from the ideas we've covered.
+
 Run:  python3 basic_pairs.py
-Then change the numbers in the SETTINGS block and rerun to see what happens.
+It runs the strategy once for each stop level in STOP_VALUES, prints one comparison
+table, and saves one chart per stop level. Change the SETTINGS block and rerun.
 """
+import datetime
+import json
 import urllib.request
+
 import numpy as np
 
 # Use the operating system's trusted certificates (fixes SSL errors on some Macs,
@@ -20,8 +25,15 @@ SYMBOL_B = "PEP"       # stock B
 WINDOW = 60            # days used for beta, average and std dev of the spread
 ENTRY_Z = 2.0          # open a trade when |z| is above this
 EXIT_Z = 0.5           # close the trade when |z| falls below this
+STOP_VALUES = [None, 3.0, 4.0, 5.0]   # stop levels to compare. None = no stop.
+                       # STOP: if |z| goes beyond this, we were wrong -> close at a loss and
+                       # stay out until the gap is back to normal.
 COST_BPS = 3.0         # trading cost per $ traded, in basis points (3 = 0.03%)
+USE_ADJUSTED = True    # True = dividend-adjusted prices (dividends no longer look like
+                       # sudden drops in the spread). False = raw closing prices.
 # -------------------------------------------------------------
+
+_CACHE = {}
 
 
 def _download_stooq(sym):
@@ -34,15 +46,20 @@ def _download_stooq(sym):
     return prices
 
 
-def _download_yahoo(sym):
-    import json, datetime
+def _download_yahoo(sym, adjusted):
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
            f"?range=10y&interval=1d&events=history")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     data = json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
     res = data["chart"]["result"][0]
     stamps = res["timestamp"]
-    closes = res["indicators"]["quote"][0]["close"]
+    if adjusted:
+        try:
+            closes = res["indicators"]["adjclose"][0]["adjclose"]   # dividend-adjusted
+        except (KeyError, IndexError):
+            raise ValueError(f"Yahoo response for {sym} has no adjusted close")
+    else:
+        closes = res["indicators"]["quote"][0]["close"]             # raw close
     prices = {datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%d"): float(c)
               for t, c in zip(stamps, closes) if c is not None}
     if len(prices) < 300:
@@ -51,8 +68,18 @@ def _download_yahoo(sym):
 
 
 def load_prices():
-    """Download daily closes (Stooq, then Yahoo). Fall back to fake data if both fail."""
-    for name, fetch in (("Stooq", _download_stooq), ("Yahoo", _download_yahoo)):
+    """Download daily prices (Yahoo, then Stooq). Fall back to fake data if both fail."""
+    if "data" in _CACHE:
+        return _CACHE["data"]
+
+    if USE_ADJUSTED:
+        sources = (("Yahoo, adjusted", lambda s: _download_yahoo(s, True)),
+                   ("Stooq, UNADJUSTED", _download_stooq))
+    else:
+        sources = (("Yahoo, unadjusted", lambda s: _download_yahoo(s, False)),
+                   ("Stooq, unadjusted", _download_stooq))
+
+    for i, (name, fetch) in enumerate(sources):
         try:
             pa, pb = fetch(SYMBOL_A), fetch(SYMBOL_B)
             dates = sorted(set(pa) & set(pb))
@@ -60,7 +87,10 @@ def load_prices():
                 raise ValueError("not enough overlapping dates")
             a = np.array([pa[d] for d in dates])
             b = np.array([pb[d] for d in dates])
-            return dates, a, b, f"REAL ({name})"
+            if USE_ADJUSTED and i > 0:
+                print("\n*** WARNING: adjusted prices were not available. Using UNADJUSTED prices. ***\n")
+            _CACHE["data"] = (dates, a, b, f"REAL ({name})")
+            return _CACHE["data"]
         except Exception as exc:
             print(f"[{name} download failed: {type(exc).__name__}: {exc}]")
 
@@ -75,17 +105,20 @@ def load_prices():
         gap[t] = 0.95 * gap[t - 1] + rng.normal(0, 0.01)  # pulled back toward 0
     log_a = 0.8 * log_b + gap + 0.5
     dates = [str(i) for i in range(n)]
-    return dates, np.exp(log_a), np.exp(log_b), "FAKE"
+    _CACHE["data"] = (dates, np.exp(log_a), np.exp(log_b), "FAKE")
+    return _CACHE["data"]
 
 
-def run():
-    dates, price_a, price_b, source = load_prices()
+def simulate(data, stop_z):
+    """Run the strategy once with the given stop level. Returns a dict of results."""
+    dates, price_a, price_b, source = data
     log_a, log_b = np.log(price_a), np.log(price_b)   # logs = percentage-scale prices
     n = len(log_a)
 
     position = 0        # +1 = long A / short B, -1 = short A / long B, 0 = flat
+    blocked = False     # True after a stop: no new trades until the gap is back to normal
     returns = np.zeros(n)
-    trades = []
+    trades = []         # (day index, date, label, new position, z)
     prev_weights = np.zeros(2)
     zs = np.full(n, np.nan)      # z-score each day (for the plot)
     pos_hist = np.zeros(n)       # position each day (for the plot)
@@ -108,25 +141,39 @@ def run():
         ret_a = log_a[t] - log_a[t - 1]
         ret_b = log_b[t] - log_b[t - 1]
         gross = 1 + abs(beta)
-        weights = np.array([position / gross, -position * beta / gross])  # $ in A, $ in B
         returns[t] = prev_weights[0] * ret_a + prev_weights[1] * ret_b
 
         # --- 5. decide the position for tomorrow ---
         new_position = position
+        stopped_now = False
+        too_extreme = stop_z is not None and abs(z) > stop_z   # gap is beyond the stop line
+
+        # After a stop, stay out until the gap has come back to normal (|z| < EXIT_Z).
+        if blocked and abs(z) < EXIT_Z:
+            blocked = False
+
         if position == 0:
-            if z > ENTRY_Z:
-                new_position = -1    # spread high: A expensive -> short A, long B
-            elif z < -ENTRY_Z:
-                new_position = +1    # spread low: A cheap -> long A, short B
+            # Only enter if the gap is stretched enough AND not so stretched that we'd
+            # be stopped out straight away, and we're not waiting after a stop.
+            if not blocked and not too_extreme:
+                if z > ENTRY_Z:
+                    new_position = -1    # spread high: A expensive -> short A, long B
+                elif z < -ENTRY_Z:
+                    new_position = +1    # spread low: A cheap -> long A, short B
+        elif too_extreme:
+            new_position = 0             # STOP: gap kept widening, we were wrong -> get out
+            stopped_now = True
+            blocked = True
         elif abs(z) < EXIT_Z:
-            new_position = 0         # gap has closed -> exit
+            new_position = 0             # gap has closed -> exit
 
         # --- 6. pay trading costs on whatever we changed ---
         new_weights = np.array([new_position / gross, -new_position * beta / gross])
-        turnover = np.abs(new_weights - weights * (position != 0) * 0 - prev_weights).sum()
         if new_position != position:
+            turnover = np.abs(new_weights - prev_weights).sum()
             returns[t] -= turnover * COST_BPS / 10000
-            trades.append((dates[t], "ENTER" if position == 0 else "EXIT", new_position, round(z, 2)))
+            label = "ENTER" if position == 0 else ("STOP" if stopped_now else "EXIT")
+            trades.append((t, dates[t], label, new_position, float(z)))
 
         position = new_position
         pos_hist[t] = position
@@ -136,35 +183,37 @@ def run():
     active = returns[WINDOW:]
     ann_ret = active.mean() * 252
     ann_vol = active.std() * np.sqrt(252)
-    drawdown = (equity / np.maximum.accumulate(equity) - 1).min()
-
-    print(f"Data: {source} - {SYMBOL_A}/{SYMBOL_B}, {n} days")
-    print(f"Trades (enter+exit): {len(trades)}")
-    print(f"Annual return: {ann_ret:.2%}   Annual vol: {ann_vol:.2%}")
-    print(f"Sharpe: {ann_ret / ann_vol if ann_vol else 0:.2f}   Max drawdown: {drawdown:.2%}")
-    print(f"Final equity (start = 1.00): {equity[-1]:.3f}")
-    print("First few trades:")
-    for tr in trades[:8]:
-        print("  ", tr)
-
-    # ---- worst drawdown: when did it start and end? ----
-    peak_curve = np.maximum.accumulate(equity)
-    dd = equity / peak_curve - 1
+    dd = equity / np.maximum.accumulate(equity) - 1
     trough = int(np.argmin(dd))
     peak = int(np.argmax(equity[:trough + 1]))
-    print(f"Worst drawdown {dd[trough]:.1%}: peak {dates[peak]} -> trough {dates[trough]}")
+    return {
+        "stop_z": stop_z, "trades": trades, "returns": returns, "equity": equity, "dd": dd,
+        "zs": zs, "pos_hist": pos_hist,
+        "n_trades": len(trades), "n_stops": sum(1 for tr in trades if tr[2] == "STOP"),
+        "ann_ret": ann_ret, "ann_vol": ann_vol,
+        "sharpe": ann_ret / ann_vol if ann_vol else 0.0,
+        "max_dd": dd.min(), "dd_peak": dates[peak], "dd_trough": dates[trough],
+        "final_equity": equity[-1],
+    }
 
-    make_plot(dates, log_a, log_b, zs, pos_hist, equity, dd, source, WINDOW)
+
+def chart_name(stop_z):
+    return "basic_chart_stop_off.png" if stop_z is None else f"basic_chart_stop{stop_z:g}.png"
 
 
-def make_plot(dates, log_a, log_b, zs, pos_hist, equity, dd, source, start):
+def make_plot(data, res):
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("Install matplotlib to get the chart: pip3 install matplotlib")
+        print("Install matplotlib to get the charts: pip3 install matplotlib")
         return
+
+    dates, price_a, price_b, source = data
+    log_a, log_b = np.log(price_a), np.log(price_b)
+    stop_z = res["stop_z"]
+    zs, pos_hist, equity, dd = res["zs"], res["pos_hist"], res["equity"], res["dd"]
 
     if "-" in dates[0]:
         x = np.array(dates, dtype="datetime64[D]")
@@ -183,10 +232,18 @@ def make_plot(dates, log_a, log_b, zs, pos_hist, equity, dd, source, start):
     ax[1].plot(x, zs, linewidth=0.8, color="black")
     for level, style in ((ENTRY_Z, "--"), (-ENTRY_Z, "--"), (EXIT_Z, ":"), (-EXIT_Z, ":")):
         ax[1].axhline(level, linestyle=style, color="grey")
+    if stop_z is not None:
+        ax[1].axhline(stop_z, linestyle="-.", color="red", alpha=0.6, label=f"stop line (+/-{stop_z:g})")
+        ax[1].axhline(-stop_z, linestyle="-.", color="red", alpha=0.6)
     in_trade = pos_hist != 0
     ax[1].fill_between(x, -6, 6, where=in_trade, alpha=0.15, color="orange", label="in a trade")
+    stop_trades = [tr for tr in res["trades"] if tr[2] == "STOP"]
+    if stop_trades:
+        idx = [tr[0] for tr in stop_trades]
+        ax[1].scatter(x[idx], np.clip([tr[4] for tr in stop_trades], -6, 6),
+                      marker="x", color="red", s=70, zorder=5, label=f"stop triggered ({len(idx)})")
     ax[1].set_ylim(-6, 6)
-    ax[1].set_title("2. Z-score of the gap (dashed = entry, dotted = exit, orange = we hold a trade)")
+    ax[1].set_title("2. Z-score of the gap (orange = we hold a trade, red X = stopped out)")
     ax[1].legend(loc="upper right")
 
     # Panel 3: equity and drawdown
@@ -195,13 +252,36 @@ def make_plot(dates, log_a, log_b, zs, pos_hist, equity, dd, source, start):
     ax2 = ax[2].twinx()
     ax2.fill_between(x, dd * 100, 0, color="red", alpha=0.25)
     ax2.set_ylabel("drawdown (%)")
-    ax[2].set_title("3. Strategy equity (green) and drawdown (red)")
+    ax[2].set_title(f"3. Strategy equity (green) and drawdown (red)  -  Sharpe {res['sharpe']:.2f}, "
+                    f"worst drawdown {res['max_dd']:.1%}")
 
-    fig.suptitle(f"{SYMBOL_A}/{SYMBOL_B} pairs trading - {source} data", fontsize=13)
+    stop_text = "no stop" if stop_z is None else f"stop {stop_z:g}"
+    fig.suptitle(f"{SYMBOL_A}/{SYMBOL_B} pairs trading, {stop_text} - {source}", fontsize=13)
     fig.tight_layout()
-    fig.savefig("basic_chart.png", dpi=120)
-    print("Saved chart: basic_chart.png")
+    fig.savefig(chart_name(stop_z), dpi=120)
+    plt.close(fig)
+
+
+def main():
+    data = load_prices()
+    dates, _, _, source = data
+    print(f"Data: {source} - {SYMBOL_A}/{SYMBOL_B}, {len(dates)} days")
+    print(f"Settings: entry {ENTRY_Z}, exit {EXIT_Z}, window {WINDOW}, cost {COST_BPS} bps\n")
+
+    results = [simulate(data, s) for s in STOP_VALUES]
+
+    header = f"{'Stop':>6} {'Trades':>7} {'Stops':>6} {'Ann.ret':>8} {'Vol':>7} {'Sharpe':>7} {'MaxDD':>8}  Worst drawdown (peak -> trough)"
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        stop_text = "off" if r["stop_z"] is None else f"{r['stop_z']:g}"
+        print(f"{stop_text:>6} {r['n_trades']:>7} {r['n_stops']:>6} {r['ann_ret']:>8.2%} {r['ann_vol']:>7.2%} "
+              f"{r['sharpe']:>7.2f} {r['max_dd']:>8.2%}  {r['dd_peak']} -> {r['dd_trough']}")
+
+    for r in results:
+        make_plot(data, r)
+    print("\nSaved charts: " + ", ".join(chart_name(s) for s in STOP_VALUES))
 
 
 if __name__ == "__main__":
-    run()
+    main()
